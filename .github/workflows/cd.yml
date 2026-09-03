@@ -1,0 +1,57 @@
+# CD — roda a cada push na main (ou seja, pós-merge de PR). Aplica o RDS MySQL.
+#
+# Depende do repositório fiap-mecanica-infra-k8s já ter sido aplicado antes (lê vpc_id/subnet_id/
+# eks_cluster_security_group_id de lá via terraform_remote_state) — numa infra do zero, rode o CD
+# daquele repositório primeiro.
+
+name: CD
+
+on:
+  push:
+    branches: [ "main" ]
+
+concurrency:
+  group: cd-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  terraform-apply:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: producao
+    permissions:
+      contents: read
+    env:
+      TF_VAR_db_username: ${{ secrets.TF_VAR_DB_USERNAME }}
+      TF_VAR_db_password: ${{ secrets.TF_VAR_DB_PASSWORD }}
+    outputs:
+      db_endpoint: ${{ steps.tf_outputs.outputs.db_endpoint }}
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+        aws-region: ${{ env.AWS_REGION }}
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+    - name: Terraform init
+      run: terraform init
+    - name: Terraform apply
+      run: terraform apply -auto-approve
+    - name: Capturar outputs do Terraform
+      id: tf_outputs
+      run: echo "db_endpoint=$(terraform output -raw db_endpoint)" >> "$GITHUB_OUTPUT"
+    - name: Publicar o endpoint no resumo da run
+      run: |
+        {
+          echo "### RDS"
+          echo ""
+          echo "\`$(terraform output -raw db_endpoint)\`"
+        } >> "$GITHUB_STEP_SUMMARY"
