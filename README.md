@@ -1,56 +1,54 @@
 # Infraestrutura de Banco de Dados — fiap-mecanica-infra-db (Terraform)
 
-Provisiona o RDS MySQL da aplicação `fiap-mecanica`: instância, subnet group e security group.
+## Propósito
 
-Um dos **4 repositórios** exigidos pela Fase 3 (Lambda, Infra Kubernetes, Infra de Banco — este
-—, Aplicação). Nasceu em 2026-09-03 a partir de uma divisão do repositório `fiap-mecanica`, que
-antes concentrava toda a infraestrutura (incluindo o banco) num state só.
+Provisiona o **banco de dados gerenciado** da aplicação [Mecânica FIAP](https://github.com/ArthurPeruzzo/fiap-mecanica): uma instância **Amazon RDS for MySQL**, seu subnet group e o security group que a protege.
+
+Um dos **4 repositórios** da Fase 3 (Aplicação, Infra Kubernetes, Infra de Banco — este —, Lambda). Não cria rede própria: reaproveita a VPC/subnets do cluster, lidas do repositório `fiap-mecanica-infra-k8s`.
+
+## Tecnologias
+
+- **Terraform** (backend S3 com lock nativo `use_lockfile`; `required_version >= 1.10`)
+- **AWS**: RDS for MySQL 8.0 (`db.t3.micro`, 20 GB gp2, criptografado, `publicly_accessible = false`), DB Subnet Group, Security Group
+- **`terraform_remote_state`** — leitura somente-leitura do state do `fiap-mecanica-infra-k8s`
+- **GitHub Actions** (CI/CD)
+
+## Arquitetura
+
+```mermaid
+graph TD
+    subgraph K8SSTATE["state do fiap-mecanica-infra-k8s (remote_state)"]
+        RS["vpc_id · subnet_id ·<br/>eks_cluster_security_group_id"]
+    end
+
+    subgraph VPC["VPC do cluster (10.0.0.0/16)"]
+        subgraph SNG["DB Subnet Group (subnets públicas do cluster)"]
+            RDS[("aws_db_instance.mysql<br/>fiap-mecanica-db · MySQL 8.0")]
+        end
+        SG["aws_security_group.db_sg<br/>ingress 3306 ← SG do cluster EKS"]
+        NODES["Nós / pods do EKS"]
+    end
+
+    RS -.define.-> SNG
+    RS -.define.-> SG
+    SG --- RDS
+    NODES -->|JDBC :3306| RDS
+```
+
+O RDS só aceita conexões na porta 3306 vindas do **security group do control plane do EKS** — ou seja, dos pods da aplicação. Não é acessível pela internet.
 
 ## Recursos criados
 
 | Arquivo | Recurso | O que é |
 |---|---|---|
 | `database.tf` | `aws_db_subnet_group.db_subnet_group` | Subnet group nas subnets públicas do cluster (lidas via remote state) |
-| `database.tf` | `aws_security_group.db_sg` | Libera a porta 3306 só para o SG do cluster EKS (lido via remote state) |
-| `database.tf` | `aws_db_instance.mysql` | RDS MySQL 8.0 privado (`publicly_accessible = false`), criptografado |
+| `database.tf` | `aws_security_group.db_sg` | Libera a porta 3306 só para o SG do cluster EKS |
+| `database.tf` | `aws_db_instance.mysql` | RDS MySQL 8.0 privado, criptografado, `skip_final_snapshot = true` |
+| `data.tf` | `data.terraform_remote_state.k8s` | Leitura do state do `fiap-mecanica-infra-k8s` (`tfstate/terraform.tfstate`) |
 
-## Dependência do repositório fiap-mecanica-infra-k8s
+## Dependência do `fiap-mecanica-infra-k8s`
 
-Este módulo **não cria VPC nem subnets** — lê `vpc_id`, `subnet_id` e
-`eks_cluster_security_group_id` do repositório `fiap-mecanica-infra-k8s` via
-`data.terraform_remote_state.k8s` (`data.tf`), somente leitura, mesmo bucket S3, chave
-`tfstate/terraform.tfstate`. Consequência prática: **o CD daquele repositório precisa ter
-rodado com sucesso antes do primeiro CD deste** — numa conta zerada, sem isso o `terraform plan`
-falha tentando ler uma chave de state que ainda não existe.
-
-## Migração (2026-09-03) — via `import`, sem derrubar o banco
-
-Diferente de VPC/EKS (que não precisaram de nenhuma operação de state) e diferente de New Relic
-(que foi recriado do zero), o RDS foi migrado com `terraform import` — não `destroy`+`create` —
-porque:
-- o ID de import destes 3 recursos é só o próprio nome/identificador
-  (`fiap-mecanica-db-subnet-group`, o ID do SG, `fiap-mecanica-db`), documentado e sem
-  ambiguidade — mesmo esforço de um destroy+create;
-- destruir e recriar o RDS derrubaria a aplicação por ~10-15 minutos (toda rota que toca o banco
-  em 500 nesse meio tempo) — sem motivo, já que importar custa o mesmo.
-
-O RDS é, o tempo todo, o **mesmo recurso físico** — mesmo endpoint, mesmos dados, zero
-interrupção real na aplicação durante a migração.
-
-### Uma diferença de `plan` que é esperada e permanente, não um bug
-
-Depois do import, `terraform plan` **nunca** vai mostrar "No changes" para
-`aws_db_instance.mysql" — sempre aparecem estas 4 diferenças, todas conhecidas e sem risco:
-
-| Campo | Por quê |
-|---|---|
-| `password` | A AWS **nunca devolve a senha master** via API — o import fica sem esse valor, e qualquer valor que você passar em `TF_VAR_db_password` aparece como "sendo adicionado". **Nunca rode `terraform apply` sem ter certeza de que esse valor é a senha real** — aplicar com um valor errado rotaciona a senha do banco de produção. |
-| `apply_immediately` | Não é um atributo real do RDS, é uma diretriz do Terraform sobre *como* aplicar mudanças futuras — import não reconstrói isso, só um `apply` bem-sucedido grava esse valor no state. |
-| `engine_version` (`8.0.46` → `8.0`) | Comportamento documentado do provider AWS: a supressão de diff entre versão-minor-real e versão-configurada depende de um rastreamento interno que só existe em recursos criados via `apply`, não via `import`. Resolve sozinho no primeiro `apply` real. |
-| `username` | Metadado de sensibilidade mudando entre versões do provider — o próprio Terraform avisa "o valor não mudou". |
-
-Nenhum desses 4 é destrutivo, e nenhum foi aplicado durante a migração — só o `import` foi
-executado. Um `apply` futuro, com a senha real, resolve todos de uma vez.
+Lê `vpc_id`, `subnet_id` e `eks_cluster_security_group_id` via `data.terraform_remote_state.k8s` — mesmo bucket S3, chave `tfstate/terraform.tfstate`, somente leitura. Consequência: **o CD daquele repositório precisa ter rodado com sucesso antes do primeiro CD deste**; numa conta zerada, sem isso o `terraform plan` falha tentando ler uma chave de state que ainda não existe.
 
 ## Variáveis (`vars.tf`)
 
@@ -61,42 +59,45 @@ executado. Um `apply` futuro, com a senha real, resolve todos de uma vez.
 | `tags` | `{Name = "fiap-mecanica-terraform"}` | Tags aplicadas aos recursos |
 | `db_name` | `mecanica` | Nome do banco criado no RDS |
 | `db_instance_class` | `db.t3.micro` | Classe da instância RDS |
-| `db_username` | — (obrigatório) | Usuário master do RDS |
+| `db_username` | — (obrigatório, sensível) | Usuário master do RDS |
 | `db_password` | — (obrigatório, sensível) | Senha master do RDS |
 
 ## Outputs (`output.tf`)
 
-| Output | Uso |
+| Output | Consumido por |
 |---|---|
-| `db_endpoint` | Consumido pelo `app-infra` do repositório `fiap-mecanica`, via `terraform_remote_state` — monta o `DB_URL` do ConfigMap da aplicação |
+| `db_endpoint` | `app-infra` do repositório `fiap-mecanica` (via `terraform_remote_state`) — monta o `DB_URL` do ConfigMap da aplicação |
 | `db_name` | Nome do banco (`mecanica`) |
 
-## CI/CD
+## Execução e deploy
 
-- `ci.yml` (Pull Request): `terraform plan`.
-- `cd.yml` (push na `main`): `terraform apply`.
+### Automático (CI/CD)
 
-Secrets necessários: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` (sessão da
-conta Academy Lab) e `TF_VAR_DB_USERNAME`/`TF_VAR_DB_PASSWORD` — **o mesmo par de credenciais já
-usado no repositório `fiap-mecanica`** (que ainda precisa delas para montar o Secret Kubernetes
-com que a aplicação conecta no banco).
+- **`ci.yml`** (Pull Request): `terraform plan`.
+- **`cd.yml`** (push na `main`): garante o bucket do backend → `terraform apply` → publica o `db_endpoint` no resumo da run.
+
+Branch `main` protegida — merge só via Pull Request.
+
+**Secrets:** `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` (sessão da Academy Lab) e `TF_VAR_DB_USERNAME` / `TF_VAR_DB_PASSWORD` — o **mesmo par** usado no repositório `fiap-mecanica` (que precisa dele para montar o Secret Kubernetes com que a aplicação conecta no banco). Se divergirem, a aplicação não autentica no RDS.
+
+### Manual
+
+```bash
+terraform init
+TF_VAR_db_username=<usuario> TF_VAR_db_password=<senha> terraform apply
+```
+
+> ⚠️ `db_password` é aplicada como senha master do RDS. Rodar `apply` com um valor errado **rotaciona a senha do banco**. Garanta que o valor bate com o `TF_VAR_DB_PASSWORD` do repositório `fiap-mecanica`.
 
 ## Ordem de deploy numa infra do zero
 
 ```
-1º fiap-mecanica-infra-k8s   (este repositório lê o state dele)
-2º fiap-mecanica-infra-db    (este)
-3º fiap-mecanica-lambda      (independente)
-4º fiap-mecanica             (app-infra lê o state deste)
+1º  fiap-mecanica-infra-k8s   (este repositório lê o state dele)
+2º  fiap-mecanica-infra-db    (este)
+3º  fiap-mecanica-lambda      (independente)
+4º  fiap-mecanica             (app-infra lê o state deste)
 ```
 
-## Destruir
+## Documentação da API
 
-Antes de `fiap-mecanica-infra-k8s` (que este lê), depois do `app-infra`/`apigateway` do
-`fiap-mecanica` (que leem este):
-
-```
-1º fiap-mecanica (app-infra + apigateway)
-2º fiap-mecanica-infra-db (este)
-3º fiap-mecanica-infra-k8s
-```
+Este repositório não expõe APIs. A documentação (Swagger) e a coleção de endpoints estão no repositório da aplicação: [fiap-mecanica](https://github.com/ArthurPeruzzo/fiap-mecanica#documentação-da-api).
