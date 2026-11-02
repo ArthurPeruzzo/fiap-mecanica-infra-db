@@ -93,10 +93,13 @@ TF_VAR_db_username=<usuario> TF_VAR_db_password=<senha> terraform apply
 
 ```
 1º  fiap-mecanica-infra-k8s   (este repositório lê o state dele)
-2º  fiap-mecanica-infra-db    (este)
-3º  fiap-mecanica-lambda      (independente)
-4º  fiap-mecanica             (app-infra lê o state deste)
+2º  fiap-mecanica-infra-db    (este)                   ┐ independentes entre si:
+    fiap-estoque              (RDS próprio do estoque) │ podem rodar em paralelo
+    fiap-mecanica-lambda                               ┘
+3º  fiap-mecanica             (app-infra lê o state deste e do cluster)
 ```
+
+**Execução manual:** este CD também tem o gatilho `workflow_dispatch` (Actions → CD → *Run workflow*). O GitHub não deixa reexecutar um run com mais de 30 dias, e numa conta nova da AWS Academy Lab (que zera toda a infra) o último run costuma estar velho demais.
 
 ## Documentação da API
 
