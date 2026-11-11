@@ -26,7 +26,7 @@ graph TD
             RDS[("aws_db_instance.mysql<br/>fiap-mecanica-db · MySQL 8.0")]
         end
         SG["aws_security_group.db_sg<br/>ingress 3306 ← SG do cluster EKS"]
-        NODES["Nós / pods do EKS"]
+        NODES["Pods do fiap-mecanica (EKS)"]
     end
 
     RS -.define.-> SNG
